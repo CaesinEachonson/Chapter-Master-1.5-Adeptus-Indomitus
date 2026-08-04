@@ -383,6 +383,33 @@ if (_lc || _rc) {
 }
 
 // ---------------------------------------------------------------------------
+// Member icon selection inside the right panel. Runs only when the click was
+// not consumed by a button, and only while looking at a single selected squad.
+// ---------------------------------------------------------------------------
+if (!_consumed && _lc && (array_length(selected) > 0)) {
+    var _sqn2 = grid_selected_squads(id);
+    if (array_length(_sqn2) == 1) {
+        var _sel_squad = squads[_sqn2[0]];
+        if (array_length(_sel_squad.members) > 0) {
+            var _hit_idx = grid_member_icon_hit(id, _mgx, _mgy);
+            if (_hit_idx >= 0) {
+                member_selected = _hit_idx;
+                member_selected_squad = _sqn2[0];
+            } else {
+                member_selected = -1;
+                member_selected_squad = -1;
+            }
+        } else {
+            member_selected = -1;
+            member_selected_squad = -1;
+        }
+    } else {
+        member_selected = -1;
+        member_selected_squad = -1;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Battlefield: left selects and drags, right commands. Standard RTS handling.
 // ---------------------------------------------------------------------------
 if (!_consumed && grid_in_viewport(_mgx, _mgy)) {
@@ -480,7 +507,11 @@ if (drag_active && !_lheld) {
 }
 
 grid_sel_prune(id);
-
+// Drop a stale member selection when the squad under it is no longer selected.
+if ((member_selected_squad >= 0) && !array_contains(grid_selected_squads(id), member_selected_squad)) {
+    member_selected = -1;
+    member_selected_squad = -1;
+}
 
 // Control groups. Ctrl and a number binds the current selection, the number on
 // its own recalls it, which is what every RTS has trained hands to expect.

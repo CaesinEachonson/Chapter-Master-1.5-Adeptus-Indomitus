@@ -697,7 +697,6 @@ if (array_length(selected) > 0) {
     var _isq = grid_selected_squads(id);
     var _py2 = _iy + 100;
     if (array_length(_isq) == 1) {
-        // One squad: the full card. Name first, since that is what was missing.
         var _one = squads[_isq[0]];
         draw_set_color(c_white);
         draw_set_font(fnt_40k_14);
@@ -708,88 +707,155 @@ if (array_length(selected) > 0) {
         draw_text(GRIDC_RP_X1 + 10, _py2, grid_unit_def(_one.type).disp);
         _py2 += 20;
         if (_one.is_vehicle) {
+            // Vehicles keep the existing textual card, since their weapon
+            // mounts are not per-member.
             draw_text(GRIDC_RP_X1 + 10, _py2, $"Hull {round(_one.hp_pool)} of {round(_one.hp_max)}");
-        } else {
-            draw_text(GRIDC_RP_X1 + 10, _py2, $"{_one.men} of {_one.men0} men, {_one.hp_man} hp each");
-        }
-        _py2 += 20;
-        draw_text(GRIDC_RP_X1 + 10, _py2, $"Armour {_one.armour}");
-        _py2 += 20;
-        draw_text(GRIDC_RP_X1 + 10, _py2, $"Melee {_one.mel}  Ranged {_one.bal}");
-        _py2 += 20;
-        if (array_length(_one.weapons) > 1) {
-            for (var _wi = 0; _wi < array_length(_one.weapons); _wi++) {
-                var _w = _one.weapons[_wi];
-                draw_set_color(c_white);
-                draw_text(GRIDC_RP_X1 + 10, _py2, _w.wep);
-                _py2 += 16;
-                draw_set_color(GRIDC_GREEN);
-                draw_text(GRIDC_RP_X1 + 26, _py2, $"Ballistic {_w.bal}  Range {_w.rng}  AP {_w.ap_r}");
-                _py2 += 14;
-                draw_text(GRIDC_RP_X1 + 26, _py2, $"Ammo {_w.ammo}{(_w.fire_int > 1) ? $"  Fires every {_w.fire_int} ticks" : ""}");
-                _py2 += 18;
-            }
-        } else {
-            var _w0 = _one.weapons[0];
-            if (_one.geared) {
-                var _apx = "";
-                if ((_w0.ap_r > 0) || (_one.ap_m > 0)) {
-                    _apx = $"  AP {max(_w0.ap_r, _one.ap_m)}";
-                }
-                var _mob2 = "";
-                if (_one.can_jump && (_one.type != "assault") && (_one.type != "assault_term")) {
-                    _mob2 = "  Jump Packs";
-                } else if (_one.spd > grid_unit_def(_one.type).spd) {
-                    _mob2 = "  Bikes";
-                }
-                draw_text(GRIDC_RP_X1 + 10, _py2, $"{_w0.wep}{_apx}{_mob2}");
-                _py2 += 20;
-            }
-            draw_text(GRIDC_RP_X1 + 10, _py2, $"Range {_w0.rng} tiles  Speed {_one.spd}");
             _py2 += 20;
-            if (_w0.fire_int > 1) {
-                draw_text(GRIDC_RP_X1 + 10, _py2, $"Fires every {_w0.fire_int} ticks");
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Armour {_one.armour}");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Melee {_one.mel}  Ranged {_one.bal}");
+            _py2 += 20;
+            if (array_length(_one.weapons) > 1) {
+                for (var _wi = 0; _wi < array_length(_one.weapons); _wi++) {
+                    var _w = _one.weapons[_wi];
+                    draw_set_color(c_white);
+                    draw_text(GRIDC_RP_X1 + 10, _py2, _w.wep);
+                    _py2 += 16;
+                    draw_set_color(GRIDC_GREEN);
+                    draw_text(GRIDC_RP_X1 + 26, _py2, $"Ballistic {_w.bal}  Range {_w.rng}  AP {_w.ap_r}");
+                    _py2 += 14;
+                    draw_text(GRIDC_RP_X1 + 26, _py2, $"Ammo {_w.ammo}{(_w.fire_int > 1) ? $"  Fires every {_w.fire_int} ticks" : ""}");
+                    _py2 += 18;
+                }
+            } else {
+                var _w0 = _one.weapons[0];
+                if (_one.geared) {
+                    var _apx = "";
+                    if ((_w0.ap_r > 0) || (_one.ap_m > 0)) {
+                        _apx = $"  AP {max(_w0.ap_r, _one.ap_m)}";
+                    }
+                    var _mob2 = "";
+                    if (_one.can_jump && (_one.type != "assault") && (_one.type != "assault_term")) {
+                        _mob2 = "  Jump Packs";
+                    } else if (_one.spd > grid_unit_def(_one.type).spd) {
+                        _mob2 = "  Bikes";
+                    }
+                    draw_text(GRIDC_RP_X1 + 10, _py2, $"{_w0.wep}{_apx}{_mob2}");
+                    _py2 += 20;
+                }
+                draw_text(GRIDC_RP_X1 + 10, _py2, $"Range {_w0.rng} tiles  Speed {_one.spd}");
+                _py2 += 20;
+                if (_w0.fire_int > 1) {
+                    draw_text(GRIDC_RP_X1 + 10, _py2, $"Fires every {_w0.fire_int} ticks");
+                    _py2 += 20;
+                }
+                if (_w0.ammo <= 0) {
+                    draw_set_color(GRIDC_ORANGE);
+                    draw_text(GRIDC_RP_X1 + 10, _py2, "OUT OF AMMO");
+                    draw_set_color(GRIDC_GREEN);
+                } else {
+                    draw_text(GRIDC_RP_X1 + 10, _py2, $"Ammo: {_w0.ammo} volleys");
+                }
                 _py2 += 20;
             }
-            if (_w0.ammo <= 0) {
+        } else if (array_length(_one.members) > 0) {
+            // Infantry squad with per-member state: RTS style icon grid.
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"{_one.men} of {_one.men0} standing");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Armour {_one.armour}");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Melee {_one.mel}  Ranged {_one.bal}");
+            _py2 += 20;
+
+            // Member icon grid.
+            var _gx0 = GRIDC_RP_X1 + 10;
+            var _gy0 = grid_member_grid_y(id);
+            var _size = 36;
+            var _spacing = 4;
+            var _cols = 6;
+            for (var _mi = 0; _mi < array_length(_one.members); _mi++) {
+                var _mem = _one.members[_mi];
+                var _col = _mi mod _cols;
+                var _row = _mi div _cols;
+                var _ix = _gx0 + _col * (_size + _spacing);
+                var _iy2 = _gy0 + _row * (_size + _spacing);
+                var _hover = point_in_rectangle(_mx, _my, _ix, _iy2, _ix + _size, _iy2 + _size);
+                var _selected = (member_selected == _mi) && (member_selected_squad == _isq[0]);
+
+                // Base tile.
+                var _hp_frac = clamp(_mem.mhp / max(1, _mem.mhp_max), 0, 1);
+                if (!_mem.alive) {
+                    draw_set_alpha(0.35);
+                    draw_set_color(c_gray);
+                } else if (_hp_frac <= 0.25) {
+                    draw_set_color(make_color_rgb(120, 50, 40));
+                } else if (_hp_frac <= 0.5) {
+                    draw_set_color(make_color_rgb(120, 90, 40));
+                } else {
+                    draw_set_color(GRIDC_PANEL);
+                }
+                draw_rectangle(_ix, _iy2, _ix + _size, _iy2 + _size, false);
+                draw_set_alpha(1);
+
+                // Border colour.
+                if (!_mem.alive) {
+                    draw_set_color(c_gray);
+                } else if (_selected) {
+                    draw_set_color(c_white);
+                } else if (_hover) {
+                    draw_set_color(GRIDC_GREEN);
+                } else if (_hp_frac <= 0.5) {
+                    draw_set_color(GRIDC_COL_WARN);
+                } else {
+                    draw_set_color(GRIDC_GREEN);
+                }
+                draw_rectangle(_ix, _iy2, _ix + _size, _iy2 + _size, true);
+
+                // Weapon abbreviation inside the tile.
+                if (_mem.alive) {
+                    draw_set_font(fnt_small);
+                    draw_set_halign(fa_center);
+                    draw_set_valign(fa_middle);
+                    draw_set_color(_mem.ap_r > 0 ? GRIDC_COL_ORDER : c_white);
+                    draw_text(_ix + (_size / 2), _iy2 + (_size / 2) - 4, grid_weapon_abbrev(_mem.wep));
+                    // Ammo shorthand in the corner.
+                    draw_set_font(fnt_tiny);
+                    draw_set_color((_mem.ammo <= 0) ? GRIDC_RED : GRIDC_DIM);
+                    draw_text(_ix + (_size / 2), _iy2 + (_size / 2) + 8, string(_mem.ammo));
+                    draw_set_font(fnt_40k_12);
+                } else {
+                    // Red X over dead member.
+                    draw_set_color(GRIDC_RED);
+                    draw_line(_ix + 4, _iy2 + 4, _ix + _size - 4, _iy2 + _size - 4);
+                    draw_line(_ix + _size - 4, _iy2 + 4, _ix + 4, _iy2 + _size - 4);
+                }
+
+                // Hover/selected popup.
+                if ((_hover || _selected) && _mem.alive) {
+                    grid_draw_member_popup(id, _one, _mi, _ix, _iy2, _size);
+                }
+            }
+            draw_set_halign(fa_left);
+            draw_set_valign(fa_top);
+        } else {
+            // Falling back to the legacy text card for any unmatched squad.
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"{_one.men} of {_one.men0} men, {_one.hp_man} hp each");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Armour {_one.armour}");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Melee {_one.mel}  Ranged {_one.bal}");
+            _py2 += 20;
+            draw_text(GRIDC_RP_X1 + 10, _py2, $"Range {_one.rng} tiles  Speed {_one.spd}");
+            _py2 += 20;
+            if (_one.ammo <= 0) {
                 draw_set_color(GRIDC_ORANGE);
                 draw_text(GRIDC_RP_X1 + 10, _py2, "OUT OF AMMO");
                 draw_set_color(GRIDC_GREEN);
             } else {
-                draw_text(GRIDC_RP_X1 + 10, _py2, $"Ammo: {_w0.ammo} volleys");
+                draw_text(GRIDC_RP_X1 + 10, _py2, $"Ammo: {_one.ammo} volleys");
             }
             _py2 += 20;
         }
-        // The armoury line: what the squad actually carries, and how well it
-        // bites through plate. Only shown when the numbers came from real gear.
-        if (_one.geared) {
-            var _apx = "";
-            if ((_one.ap_r > 0) || (_one.ap_m > 0)) {
-                _apx = $"  AP {max(_one.ap_r, _one.ap_m)}";
-            }
-            var _mob2 = "";
-            if (_one.can_jump && (_one.type != "assault") && (_one.type != "assault_term")) {
-                _mob2 = "  Jump Packs";
-            } else if (_one.spd > grid_unit_def(_one.type).spd) {
-                _mob2 = "  Bikes";
-            }
-            draw_text(GRIDC_RP_X1 + 10, _py2, $"{_one.wep}{_apx}{_mob2}");
-            _py2 += 20;
-        }
-        draw_text(GRIDC_RP_X1 + 10, _py2, $"Range {_one.rng} tiles  Speed {_one.spd}");
-        _py2 += 20;
-        if (_one.fire_int > 1) {
-            draw_text(GRIDC_RP_X1 + 10, _py2, $"Fires every {_one.fire_int} ticks");
-            _py2 += 20;
-        }
-        if (_one.ammo <= 0) {
-            draw_set_color(GRIDC_ORANGE);
-            draw_text(GRIDC_RP_X1 + 10, _py2, "OUT OF AMMO");
-            draw_set_color(GRIDC_GREEN);
-        } else {
-            draw_text(GRIDC_RP_X1 + 10, _py2, $"Ammo: {_one.ammo} volleys");
-        }
-        _py2 += 20;
         if (_one.sgt_hp == 0) {
             draw_set_color(GRIDC_RED);
             draw_text(GRIDC_RP_X1 + 10, _py2, "Sergeant down");

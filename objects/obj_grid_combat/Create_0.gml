@@ -170,6 +170,11 @@ drag_y0 = 0;
 hover_c = -1;
 hover_r = -1;
 
+// Member icon grid interaction: which member of which squad has an open info
+// popup. -1 / -1 means nothing selected.
+member_selected = -1;
+member_selected_squad = -1;
+
 // The field itself is built on the first Step, not here: instance_create runs
 // this event immediately, so the cheat has not yet had a chance to set
 // pending_width when Create fires.

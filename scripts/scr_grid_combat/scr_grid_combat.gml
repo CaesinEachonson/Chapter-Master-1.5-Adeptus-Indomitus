@@ -469,8 +469,13 @@ function GridSquad(_side, _type, _name) constructor {
     off_c = 0;
     off_r = 0;
     // Real campaign units making up this squad, so losses map back to the men
-    // who actually died rather than to an anonymous count.
+    // who actually died rather than to an anonymous count. Kept for writeback.
     roster_refs = [];
+    // Per-member state. This is the source of truth for infantry durability:
+    // each entry carries the marine's own HP, armour, weapon and ammunition.
+    // The squad-level men / hp_pool / hp_max fields remain as aggregated
+    // display values and are resynced whenever a member dies.
+    members = [];
     zap_cd = 3;
     // Reload. fire_cd counts down each tick; ranged attacks are blocked while it
     // is running, melee is not.
@@ -509,12 +514,10 @@ function GridSquad(_side, _type, _name) constructor {
     hit_dmg = 0;
     hit_flash = 0;
 
-    // Multi-weapon slots. Infantry always has exactly one entry, which mirrors
-    // the legacy squad-level fields above. Vehicles may carry several, and each
-    // slot tracks its own weapon name, ballistic skill, range, AP, ammo,
-    // fire interval and cooldown. The legacy fields remain as aliases to the
-    // first slot so old code that reads _s.wep / _s.bal / _s.rng / _s.ammo
-    // keeps working without modification.
+    // Multi-weapon slots. Infantry always has exactly one entry initially,
+    // which mirrors the legacy squad-level fields. Vehicles may carry several,
+    // and each slot tracks its own weapon name, ballistic skill, range, AP,
+    // ammo, fire interval and cooldown.
     weapons = [];
 
     // Battlefield width carried for artillery reach scaling. Zero means the
@@ -543,6 +546,7 @@ function GridSquad(_side, _type, _name) constructor {
         ammo_out: false,
     });
 }
+
 
 /// @function GridFormation
 function GridFormation(_side, _name, _colr) constructor {
@@ -834,6 +838,27 @@ function grid_fire_interval(_key, _def) {
     return 1;
 }
 
+/// @function grid_armour_scale
+/// @description Maps a vanilla AC value to the grid armour scale. The old
+/// linear 0.62 coefficient crushed the difference between marks of power
+/// armour (MK4 20 AC vs MK7 17 AC ended up only ~2 grid points apart), so the
+/// mapping is segment based instead. Values are tuned so common power armour
+/// lands close to the existing type table (tactical 12, assault 11,
+/// devastator 12, scout 7, terminator 20).
+function grid_armour_scale(_ac) {
+    if (_ac >= 40) return 32;
+    if (_ac >= 35) return 26;
+    if (_ac >= 30) return 22;
+    if (_ac >= 25) return 17;
+    if (_ac >= 22) return 15;
+    if (_ac >= 20) return 13;    // MK4
+    if (_ac >= 18) return 12;    // MK8
+    if (_ac >= 17) return 11;    // MK7
+    if (_ac >= 16) return 10;    // MK5 / MK6
+    if (_ac >= 14) return 8;
+    if (_ac >= 12) return 6;
+    return 3;
+}
 
 /// @function grid_fire_interval_for_weapon
 /// @description Per-weapon reload rate for a named weapon. Artillery and big
@@ -1305,6 +1330,11 @@ function grid_spawn_enemy_squad(ctrl, _key, _idx, _pc = -1, _pr = -1) {
     _sq.ap_m = _eap[1];
     _sq.lib_psy = grid_enemy_psy(_key);
     grid_apply_range_class(ctrl, _sq);
+    // Enemy infantry: build per-member state so the member volley path can
+    // resolve against them. Vehicles keep an empty member array.
+    if (!_d.vehicle) {
+        grid_build_enemy_members(_sq, _d);
+    }
     var _placed = false;
     // A shaped force asks for a particular tile. If it is taken the squad falls
     // in beside it rather than being flung to the far side of the field, so a
@@ -1968,8 +1998,82 @@ function grid_hit_label(_s) {
 }
 
 /// @function grid_apply_damage
+/// @description Applies damage to a squad. When the target is an infantry
+/// squad with per-member state, the damage is converted into random member
+/// hits so the per-member armour/HP path is not bypassed by explosions or
+/// vehicle fire. Pure aggregated targets (vehicles, unmigrated units) keep
+/// the old hp_pool behaviour.
 function grid_apply_damage(ctrl, _di, _dmg, _ai, _melee, _wslot = 0) {
     var _d = ctrl.squads[_di];
+    var _a = (_ai >= 0) ? ctrl.squads[_ai] : undefined;
+
+    // Per-member fallback: if this squad carries member state, convert the
+    // aggregated damage into random hits so personal armour and HP apply.
+    if (array_length(_d.members) > 0) {
+        // Resolve attacker AP for the mitigation.
+        var _ap_used = 0;
+        if (_a != undefined) {
+            if (_melee) {
+                _ap_used = _a.ap_m;
+            } else if (array_length(_a.weapons) > 0) {
+                var _awa = _a.weapons[clamp(_wslot, 0, array_length(_a.weapons) - 1)];
+                _ap_used = _awa.ap_r;
+            }
+        }
+        var _kills = 0;
+        var _remaining = max(0, _dmg);
+        var _guard = 0;
+        while ((_remaining > 0) && (_guard < 500)) {
+            _guard += 1;
+            var _alive = grid_alive_member_indices(_d);
+            if (array_length(_alive) <= 0) {
+                break;
+            }
+            var _mi = _alive[irandom(array_length(_alive) - 1)];
+            var _mem = _d.members[_mi];
+            var _eff_arm = max(0, _mem.armour - _ap_used);
+            var _mitig = 100 / (100 + _eff_arm * 2);
+            var _chunk = _remaining * _mitig;
+            // A single hit cannot overkill past one member's remaining HP.
+            // This mirrors the "random hit assignment" flavour of the
+            // per-member volley while keeping the aggregated caller simple.
+            var _apply = min(_chunk, max(0, _mem.mhp));
+            _remaining -= _apply;
+            _mem.mhp -= _apply;
+            _d.hit_dmg += _apply;
+            _d.hit_flash = GRIDC_FLASH_FRAMES;
+            if (_mem.mhp <= 0) {
+                _mem.alive = false;
+                _kills += 1;
+                if (_d.side == 1) {
+                    ctrl.agg_ekills += 1;
+                    ctrl.total_ekills += 1;
+                } else {
+                    ctrl.agg_pkills += 1;
+                    ctrl.total_pkills += 1;
+                }
+                if (_ai >= 0) {
+                    ctrl.squads[_ai].kills += 1;
+                }
+            }
+        }
+        grid_sync_squad_fields(_d);
+        _d.hit_kills += _kills;
+        if ((_d.side == 1) && (_d.men <= 0) && _d.alive) {
+            _d.alive = false;
+            ctrl.wiped_e += 1;
+            grid_log(ctrl, $"{_d.name} destroyed!", eMSG_COLOR.LIGHTGREEN);
+            grid_floater(ctrl, _d.col, _d.row, "DESTROYED", GRIDC_COL_FEED);
+        } else if ((_d.side == 0) && (_d.men <= 0) && _d.alive) {
+            _d.alive = false;
+            ctrl.wiped_p += 1;
+            grid_log(ctrl, $"{_d.name} wiped out!", eMSG_COLOR.RED);
+            grid_floater(ctrl, _d.col, _d.row, "WIPED", GRIDC_COL_ENEMY);
+        }
+        return _kills;
+    }
+
+    // Legacy aggregated path for vehicles and unmigrated squads.
     _d.hp_pool = max(0, _d.hp_pool - _dmg);
     _d.hit_dmg += _dmg;
     _d.hit_flash = GRIDC_FLASH_FRAMES;
@@ -1984,8 +2088,7 @@ function grid_apply_damage(ctrl, _di, _dmg, _ai, _melee, _wslot = 0) {
     var _killed = _before - _after;
     grid_mark_outcome(ctrl, _di, (_killed > 0) ? GRIDHIT_WOUND : GRIDHIT_GRAZE);
     // The vanilla log speaks here, through its own tally machinery in
-    // scr_flavor, so the lines are the game's own: buffered per weapon and
-    // target, flushed every few ticks by grid_battle_tick.
+    // scr_flavor, so the lines are the game's own.
     if (_ai >= 0) {
         var _atk = ctrl.squads[_ai];
         var _wep_name = _melee ? "" : _atk.weapons[clamp(_wslot, 0, array_length(_atk.weapons) - 1)].wep;
@@ -2049,6 +2152,161 @@ function grid_apply_damage(ctrl, _di, _dmg, _ai, _melee, _wslot = 0) {
         }
     }
     return _killed;
+}
+
+/// @function grid_member_apply_damage
+/// @description Applies one hit to one member of a target squad. The damage
+/// goes through that member's personal armour; if it kills him, he is marked
+/// dead, the squad aggregates are resynced, and the kill is counted. The
+/// squad's hit_kind / hit_kills / hit_dmg fields are updated like the legacy
+/// path so floating text and the combat log stay consistent. Returns 1 when
+/// the member dies, 0 otherwise.
+function grid_member_apply_damage(ctrl, _di, _mi, _dmg, _ai, _melee, _ap_r) {
+    var _s = ctrl.squads[_di];
+    if ((_mi < 0) || (_mi >= array_length(_s.members))) {
+        return 0;
+    }
+    var _m = _s.members[_mi];
+    if (!_m.alive) {
+        return 0;
+    }
+    // Personal armour reduction. The attacker AP is subtracted directly.
+    var _eff_arm = max(0, _m.armour - _ap_r);
+    var _mitig = 100 / (100 + _eff_arm * 2);
+    var _final = max(0, _dmg * _mitig);
+    _m.mhp -= _final;
+    _s.hit_dmg += _final;
+    _s.hit_flash = GRIDC_FLASH_FRAMES;
+    var _killed = 0;
+    if (_m.mhp <= 0) {
+        _m.alive = false;
+        _killed = 1;
+        // Track the outcome for the floating text label. A wound is the worst
+        // thing that happened to this squad this tick.
+        _s.hit_kind = max(_s.hit_kind, GRIDHIT_WOUND);
+        _s.hit_kills += 1;
+        if (_s.side == 1) {
+            ctrl.agg_ekills += 1;
+            ctrl.total_ekills += 1;
+        } else {
+            ctrl.agg_pkills += 1;
+            ctrl.total_pkills += 1;
+        }
+        if (_ai >= 0) {
+            ctrl.squads[_ai].kills += 1;
+        }
+        // Sergeant casualty check: this squad's leader can be hit like anyone
+        // else. Only applies to player infantry that still have a sergeant.
+        if ((_s.sgt_hp > 0) && (random(1) < GRIDC_SGT_HIT_CHANCE)) {
+            _s.sgt_hp -= 1;
+            if (_s.sgt_hp == 0) {
+                grid_log(ctrl, $"{_s.name}: Sergeant {_s.sgt_name} is down!", eMSG_COLOR.YELLOW);
+                grid_floater(ctrl, _s.col, _s.row, "Sgt down!", GRIDC_COL_WARN);
+            }
+        }
+        grid_sync_squad_fields(_s);
+        if (_s.alive && (_s.men <= 0)) {
+            _s.alive = false;
+            _s.men = 0;
+            if (grid_in_bounds(ctrl, _s.col, _s.row) && (ctrl.occ[_s.col][_s.row] == _di)) {
+                ctrl.occ[_s.col][_s.row] = -1;
+            }
+            if (_s.side == 1) {
+                ctrl.wiped_e += 1;
+                grid_log(ctrl, $"{_s.name} destroyed!", eMSG_COLOR.LIGHTGREEN);
+                grid_floater(ctrl, _s.col, _s.row, "DESTROYED", GRIDC_COL_FEED);
+            } else {
+                ctrl.wiped_p += 1;
+                grid_log(ctrl, $"{_s.name} wiped out!", eMSG_COLOR.RED);
+                grid_floater(ctrl, _s.col, _s.row, "WIPED", GRIDC_COL_ENEMY);
+            }
+        }
+    } else {
+        // Non-lethal hit: track as a graze for the floating text label.
+        _s.hit_kind = max(_s.hit_kind, GRIDHIT_GRAZE);
+    }
+    return _killed;
+}
+
+/// @function grid_member_volley
+/// @description Infantry vs infantry ranged volley. Every living attacker with
+/// ammunition rolls his own to-hit chance. On a hit, a random living member of
+/// the target squad is picked and receives damage through his personal armour,
+/// using the actual shooter's own weapon damage, range falloff and AP. The
+/// shooter's ammunition is consumed whether the shot hits or misses.
+/// Weapon slots are rebuilt from the living members before firing so mixed
+/// squads resolve each weapon group correctly. A summary line is added to the
+/// vanilla combat log once per volley.
+function grid_member_volley(ctrl, _ai, _di, _wslot) {
+    var _a = ctrl.squads[_ai];
+    var _d = ctrl.squads[_di];
+    grid_sync_weapon_slots(_a);
+    grid_sync_weapon_slots(_d);
+    var _w = _a.weapons[clamp(_wslot, 0, array_length(_a.weapons) - 1)];
+    var _total_kills = 0;
+    var _shots = 0;
+    var _hits = 0;
+    var _att_list = grid_alive_member_indices(_a);
+    if (array_length(_att_list) <= 0) {
+        return 0;
+    }
+    for (var _i = 0; _i < array_length(_att_list); _i++) {
+        var _ai_m = _att_list[_i];
+        var _att = _a.members[_ai_m];
+        if (_att.ammo <= 0) {
+            continue;
+        }
+        // Ammunition is per shooter, spent whether the shot lands or not.
+        _att.ammo = max(0, _att.ammo - 1);
+        if ((_att.ammo == 0) && (_att.ammo_out == false)) {
+            _att.ammo_out = true;
+            grid_floater(ctrl, _a.col, _a.row, "OUT OF AMMO", GRIDC_ORANGE);
+        }
+        _shots += 1;
+        // Range falloff uses this shooter's own weapon range.
+        var _rd = grid_dist(_a.col, _a.row, _d.col, _d.row);
+        var _reach = max(1, _att.rng);
+        var _acc = GRIDC_HIT_BASE * max(GRIDC_FALLOFF_MIN, 1 - 0.45 * (max(0, _rd - 1) / _reach));
+        if (random(1) >= _acc) {
+            continue;
+        }
+        _hits += 1;
+        // Hit: pick a random living target member.
+        var _alive_t = grid_alive_member_indices(_d);
+        if (array_length(_alive_t) <= 0) {
+            break;
+        }
+        var _vic = _alive_t[irandom(array_length(_alive_t) - 1)];
+        // Damage comes from this shooter's personal weapon.
+        var _roll = _att.bal * random_range(0.8, 1.2);
+        _total_kills += grid_member_apply_damage(ctrl, _di, _vic, _roll, _ai, false, _att.ap_r);
+    }
+    grid_sync_squad_fields(_a);
+    // Combat log summary in the game's own voice. Use the target's display
+    // name and the weapon group name; if the shooter was plural (more than one
+    // alive member), add an s.
+    if (_shots > 0) {
+        var _wep_label = _w.wep;
+        if (_shots > 1) {
+            var _lcol = (_d.side == 1) ? eMSG_COLOR.LIGHTGREEN : eMSG_COLOR.RED;
+            if (_total_kills > 0) {
+                combat_kill_tally_add(_d.disp, _wep_label, _shots, _total_kills,
+                    $"{_shots} {_wep_label} strike at the {_d.disp}, killing {_total_kills}.", _lcol, "");
+            } else {
+                combat_tally_add(_d.disp, _wep_label, true, 0.2, _d.is_vehicle);
+            }
+        } else {
+            // Single shooter: keep the log tidy, use singular form.
+            var _lcol2 = (_d.side == 1) ? eMSG_COLOR.LIGHTGREEN : eMSG_COLOR.RED;
+            if (_total_kills > 0) {
+                combat_kill_tally_add(_d.disp, _wep_label, 1, _total_kills,
+                    $"A {_wep_label} strikes the {_d.disp}, killing {_total_kills}.", _lcol2, "");
+            } else {
+                combat_tally_add(_d.disp, _wep_label, true, 0.2, _d.is_vehicle);
+            }
+        }
+    }
+    return _total_kills;
 }
 
 /// @function grid_shot_style
@@ -2192,6 +2450,12 @@ function grid_blast_splash(ctrl, _ai, _di, _dmg, _blast) {
 /// multipliers and every reduction now announces itself on the field.
 /// _wslot selects which of the attacker's weapon mounts fires; melee always
 /// uses the squad's own close combat stat and ignores the slot.
+///
+/// Infantry vs infantry ranged fire takes the per-member path
+/// (grid_member_volley): every shooter rolls separately, hits are assigned to
+/// random living members of the target squad, and those members use their own
+/// armour and HP. Everything else (vehicles, melee, splash) keeps the
+/// aggregated path so the existing combat-feel is untouched.
 function grid_attack(ctrl, _ai, _di, _melee, _wslot = 0) {
     var _a = ctrl.squads[_ai];
     var _d = ctrl.squads[_di];
@@ -2204,7 +2468,9 @@ function grid_attack(ctrl, _ai, _di, _melee, _wslot = 0) {
     if (!_melee && (_w.fire_cd > 0)) {
         return 0;
     }
-    if (!_melee && (_w.ammo <= 0)) {
+    // Ammunition check. Squads with per-member ammunition do not use the slot
+    // ammo field; grid_member_volley handles dry shooters individually.
+    if (!_melee && (array_length(_a.members) == 0) && (_w.ammo <= 0)) {
         // Dry. Say so once, loudly, then fight with what is in hand.
         if (!_w.ammo_out) {
             _w.ammo_out = true;
@@ -2229,6 +2495,27 @@ function grid_attack(ctrl, _ai, _di, _melee, _wslot = 0) {
     }
     // Nothing shoots through a wall. No tracer, no reload spent: the shot was
     // never taken, and the absence of fire through a building reads correctly.
+    if (!_melee) {
+        if (grid_line_block(ctrl, _a.col, _a.row, _d.col, _d.row)[0]) {
+            return 0;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Per-member infantry path: both sides are infantry squads that carry
+    // member state. Each shooter resolves individually, ammunition is
+    // personal, and hits land on individual members of the target squad.
+    // ------------------------------------------------------------------
+    if (!_melee && (array_length(_a.members) > 0) && (array_length(_d.members) > 0)) {
+        // The volley is still gated by the mount's reload timer.
+        _w.fire_cd = max(0, _w.fire_int - 1);
+        return grid_member_volley(ctrl, _ai, _di, _wslot);
+    }
+
+    // ------------------------------------------------------------------
+    // Aggregated path: vehicles, melee attacks, splash weapons, or any
+    // squad that has not yet been migrated to member state.
+    // ------------------------------------------------------------------
     var _los = [false, 0];
     if (!_melee) {
         _los = grid_line_block(ctrl, _a.col, _a.row, _d.col, _d.row);
@@ -2774,12 +3061,9 @@ function grid_expected_volley_damage(ctrl, _ai, _di, _wslot = 0) {
 ///    tick agree on who has been claimed.
 ///
 /// 2. Ammunition is the scarce resource, so the target is scored by "volleys
-///    to kill" rather than raw distance. A squad that can one-round a target
-///    takes a kill credit over a target it would only scratch; if nothing is
-///    close to death, range decides. The distance term is deliberately small:
-///    a target worth 0.1 volleys outranks a full-health target ten tiles
-///    closer, because that is the difference between spending a round on a
-///    kill and spending it on a scratch.
+///    to kill" rather than raw distance. For squads with per-member state the
+///    score uses the number of living bodies instead of hp_pool, so a nearly
+///    wiped squad dies to a handful of hits and is prioritised correctly.
 ///
 /// _prefer is a manual focus-fire override: when the player orders a specific
 /// target, that target is always taken regardless of the lock cap. It costs a
@@ -2811,8 +3095,14 @@ function grid_pick_shot_target(ctrl, _si, _prefer = -1, _wslot = 0) {
         }
     }
     // Empty magazines and reloading slots do not claim a target.
-    if ((_w.ammo <= 0) || (_w.fire_cd > 0)) {
-        return -1;
+    if (array_length(_a.members) == 0) {
+        if ((_w.ammo <= 0) || (_w.fire_cd > 0)) {
+            return -1;
+        }
+    } else {
+        if (_w.fire_cd > 0) {
+            return -1;
+        }
     }
 
     // Manual focus fire always wins: it ignores the lock cap, but it takes a
@@ -2851,14 +3141,25 @@ function grid_pick_shot_target(ctrl, _si, _prefer = -1, _wslot = 0) {
         if (grid_line_block(ctrl, _a.col, _a.row, _d.col, _d.row)[0]) {
             continue;
         }
-        var _exp = grid_expected_volley_damage(ctrl, _si, _ti, _wslot);
-        if (_exp <= 0) {
-            continue;
+        // Score: volleys to eliminate the target. Member squads use body count.
+        var _score;
+        if (array_length(_d.members) > 0) {
+            var _score_body = grid_alive_member_indices(_d);
+            var _bodies = array_length(_score_body);
+            if (_bodies <= 0) {
+                continue;
+            }
+            // Expected hits per volley, roughly. 0.55 is the average to-hit
+            // after falloff; low range weapons shorten this naturally.
+            var _score = (_bodies * 10 / max(1, _w.bal)) + _dd;
+        } else {
+            var _exp = grid_expected_volley_damage(ctrl, _si, _ti, _wslot);
+            if (_exp <= 0) {
+                continue;
+            }
+            var _need = _d.hp_pool / _exp;
+            var _score = (_need * 10) + _dd;
         }
-        // Volleys to kill, with distance as a small tiebreak. 10 tiles of
-        // distance are worth roughly 1 volley of health.
-        var _need = _d.hp_pool / _exp;
-        var _score = (_need * 10) + _dd;
 
         if (_score < _best_score) {
             _best_score = _score;
@@ -2895,9 +3196,18 @@ function grid_max_range(_s) {
 
 /// @function grid_has_ranged
 /// @description True if any weapon slot can still shoot: has ballistic skill,
-/// ammunition and is off cooldown. A vehicle whose autocannon is dry but whose
-/// storm bolter is still loaded should keep shooting.
+/// ammunition and is off cooldown. For squads with per-member ammunition this
+/// checks the members instead, since slot ammo is not decremented there.
 function grid_has_ranged(_s) {
+    if (array_length(_s.members) > 0) {
+        for (var _i = 0; _i < array_length(_s.members); _i++) {
+            var _m = _s.members[_i];
+            if (_m.alive && (_m.ammo > 0)) {
+                return true;
+            }
+        }
+        return false;
+    }
     for (var _i = 0; _i < array_length(_s.weapons); _i++) {
         var _w = _s.weapons[_i];
         if ((_w.bal > 0) && (_w.ammo > 0) && (_w.fire_cd <= 0)) {
@@ -2917,14 +3227,18 @@ function grid_weapon_target(ctrl, _si, _wslot, _prefer) {
     return grid_pick_shot_target(ctrl, _si, _prefer, _wslot);
 }
 
-/// @function grid_fire_all_weapons
-/// @description Fires every ready ranged slot, each at its own chosen target.
-/// Shared by both sides so multi-weapon behaviour is symmetric.
 function grid_fire_all_weapons(ctrl, _si, _prefer = -1) {
     var _s = ctrl.squads[_si];
+    var _has_members = (array_length(_s.members) > 0);
     for (var _ws = 0; _ws < array_length(_s.weapons); _ws++) {
         var _w = _s.weapons[_ws];
-        if ((_w.bal <= 0) || (_w.ammo <= 0) || (_w.fire_cd > 0)) {
+        if (_w.bal <= 0) {
+            continue;
+        }
+        if (!_has_members && (_w.ammo <= 0)) {
+            continue;
+        }
+        if (_w.fire_cd > 0) {
             continue;
         }
         var _target = grid_weapon_target(ctrl, _si, _ws, _prefer);
@@ -3085,22 +3399,34 @@ function grid_move_budget(_s) {
 /// @function grid_wants_melee
 /// @description Doctrine read off the profile itself. A squad that hits harder
 /// in close combat than at range closes the distance; one that shoots better
-/// holds off and fires. The explicit melee flag still wins, so a unit built to
-/// charge charges even when it carries a decent gun, and anything with no gun
-/// at all has nothing to wait for. Multi-weapon aware: a vehicle whose main
-/// gun is dry but whose secondary is still loaded is NOT a melee squad yet.
+/// holds off and fires. Multi-weapon aware, and member-aware for ammunition.
 function grid_wants_melee(_s) {
-    // A squad with no ammunition in ANY weapon slot and working blades is a
+    // A squad with no ammunition in ANY member/weapon and working blades is a
     // melee squad now.
     var _any_ammo = false;
     var _any_bal = false;
-    for (var _i = 0; _i < array_length(_s.weapons); _i++) {
-        var _w = _s.weapons[_i];
-        if (_w.bal > 0) {
-            _any_bal = true;
+    if (array_length(_s.members) > 0) {
+        for (var _i = 0; _i < array_length(_s.members); _i++) {
+            var _m = _s.members[_i];
+            if (!_m.alive) {
+                continue;
+            }
+            if (_m.bal > 0) {
+                _any_bal = true;
+            }
+            if (_m.ammo > 0) {
+                _any_ammo = true;
+            }
         }
-        if (_w.ammo > 0) {
-            _any_ammo = true;
+    } else {
+        for (var _i = 0; _i < array_length(_s.weapons); _i++) {
+            var _w = _s.weapons[_i];
+            if (_w.bal > 0) {
+                _any_bal = true;
+            }
+            if (_w.ammo > 0) {
+                _any_ammo = true;
+            }
         }
     }
     if (!_any_ammo && (_s.mel > 0)) {
@@ -4463,7 +4789,8 @@ function grid_role_to_type(_role) {
 /// to read: a defence builds a local one and deletes it immediately. Collecting
 /// from the blocks is what lets defending, missions, ruins and hulks reach the
 /// grid at all. Allies are carried so they fight, and flagged so the writeback
-/// leaves them alone.
+/// leaves them alone. Infantry refs also carry personal weapon data (where the
+/// vanilla block exposes it) so per-member ammunition and durability work.
 function grid_collect_blocks() {
     var _out = [];
     with (obj_pnunit) {
@@ -4530,8 +4857,72 @@ function grid_collect_blocks() {
                 mbike: false,
                 mpsy: 0,
                 mdisc: "",
+                // Personal weapon fields. Filled from the block's per-marine
+                // arrays when available; otherwise a weight roll over the block
+                // gear stack decides what this marine carries.
+                mwep: "",
+                mwatt: 0,
+                mwap: 0,
+                mwrng: 0,
+                mwammo: 0,
             });
             var _ri = array_length(_out) - 1;
+
+            // Personal weapon collection.
+            var _wname = "";
+            if (variable_instance_exists(id, "marine_wep1") && is_array(marine_wep1)
+                && (_i < array_length(marine_wep1))) {
+                _wname = marine_wep1[_i];
+                if (!is_string(_wname)) {
+                    _wname = "";
+                }
+            }
+            if (_wname == "") {
+                // Fallback: roll by weight over the shared stack.
+                if ((_gear != undefined) && (array_length(_gear.stacks) > 0)) {
+                    var _tot_n = 0;
+                    for (var _gs = 0; _gs < array_length(_gear.stacks); _gs++) {
+                        _tot_n += _gear.stacks[_gs].n;
+                    }
+                    if (_tot_n > 0) {
+                        var _roll = irandom(_tot_n - 1);
+                        for (var _gs2 = 0; _gs2 < array_length(_gear.stacks); _gs2++) {
+                            _roll -= _gear.stacks[_gs2].n;
+                            if (_roll < 0) {
+                                _wname = _gear.stacks[_gs2].w;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if (_wname == "") {
+                _wname = "Bolter";
+            }
+            // Resolve the weapon's real stats through the shared weapon table.
+            var _wdata = (variable_global_exists("weapons") && is_struct(global.weapons)
+                && struct_exists(global.weapons, _wname))
+                ? global.weapons[$ _wname] : -1;
+            if (is_struct(_wdata)) {
+                var _att_v = 1;
+                if (is_struct(_wdata.attack)) {
+                    _att_v = (variable_struct_exists(_wdata.attack, "standard")
+                        && is_real(_wdata.attack.standard))
+                        ? _wdata.attack.standard : 1;
+                } else if (is_real(_wdata.attack)) {
+                    _att_v = _wdata.attack;
+                }
+                _out[_ri].mwep = _wname;
+                _out[_ri].mwatt = _att_v;
+                _out[_ri].mwap = (variable_struct_exists(_wdata, "arp") && is_real(_wdata.arp)) ? _wdata.arp : 0;
+                _out[_ri].mwrng = (variable_struct_exists(_wdata, "range") && is_real(_wdata.range)) ? _wdata.range : 5;
+                _out[_ri].mwammo = (variable_struct_exists(_wdata, "ammo") && is_real(_wdata.ammo)) ? _wdata.ammo : 0;
+            } else {
+                // Even without the table, keep the name so the member has a
+                // readable weapon and squad-level stats as fallback.
+                _out[_ri].mwep = _wname;
+            }
+
             // Librarians carry the psychic layer. Potency and discipline are
             // read here, while the world is still awake.
             if ((string_pos("Librarian", _role) > 0) && variable_struct_exists(_u, "psionic")) {
@@ -4584,7 +4975,9 @@ function grid_collect_blocks() {
                 _gear.src_men += 1;
             }
         }
-                for (var _v = 1; _v < array_length(veh_type); _v++) {
+        // Vehicles. Each vehicle builds its own gear stack from its weapon
+        // slots; see the earlier fix for the full background.
+        for (var _v = 1; _v < array_length(veh_type); _v++) {
             if (veh_type[_v] == "") {
                 continue;
             }
@@ -4595,31 +4988,31 @@ function grid_collect_blocks() {
                 _vg = { stacks: [], src_men: 1 };
                 var _vwn = [veh_wep1[_v], veh_wep2[_v], veh_wep3[_v]];
                 for (var _vw = 0; _vw < 3; _vw++) {
-                    var _wname = _vwn[_vw];
-                    if ((_wname == "") || !is_string(_wname)) {
+                    var _wname2 = _vwn[_vw];
+                    if ((_wname2 == "") || !is_string(_wname2)) {
                         continue;
                     }
                     // Read straight from the weapon table. attack is a quality
                     // struct, so pull the standard quality out before use.
-                    var _wdata = (variable_global_exists("weapons") && is_struct(global.weapons)
-                        && struct_exists(global.weapons, _wname))
-                        ? global.weapons[$ _wname] : -1;
-                    if (!is_struct(_wdata)) {
+                    var _wdata2 = (variable_global_exists("weapons") && is_struct(global.weapons)
+                        && struct_exists(global.weapons, _wname2))
+                        ? global.weapons[$ _wname2] : -1;
+                    if (!is_struct(_wdata2)) {
                         // Fallback: the name still registers, with conservative numbers.
-                        array_push(_vg.stacks, { w: _wname, n: 1, att: 1, ap: 0, rng: 5, amm: 0 });
+                        array_push(_vg.stacks, { w: _wname2, n: 1, att: 1, ap: 0, rng: 5, amm: 0 });
                         continue;
                     }
-                    var _att = 1;
-                    if (is_struct(_wdata.attack)) {
-                        _att = (variable_struct_exists(_wdata.attack, "standard") && is_real(_wdata.attack.standard))
-                            ? _wdata.attack.standard : 1;
-                    } else if (is_real(_wdata.attack)) {
-                        _att = _wdata.attack;
+                    var _att2 = 1;
+                    if (is_struct(_wdata2.attack)) {
+                        _att2 = (variable_struct_exists(_wdata2.attack, "standard") && is_real(_wdata2.attack.standard))
+                            ? _wdata2.attack.standard : 1;
+                    } else if (is_real(_wdata2.attack)) {
+                        _att2 = _wdata2.attack;
                     }
-                    var _ap = (variable_struct_exists(_wdata, "arp") && is_real(_wdata.arp)) ? _wdata.arp : 0;
-                    var _rng = (variable_struct_exists(_wdata, "range") && is_real(_wdata.range)) ? _wdata.range : 5;
-                    var _amm = (variable_struct_exists(_wdata, "ammo") && is_real(_wdata.ammo)) ? _wdata.ammo : 0;
-                    array_push(_vg.stacks, { w: _wname, n: 1, att: _att, ap: _ap, rng: _rng, amm: _amm });
+                    var _ap2 = (variable_struct_exists(_wdata2, "arp") && is_real(_wdata2.arp)) ? _wdata2.arp : 0;
+                    var _rng2 = (variable_struct_exists(_wdata2, "range") && is_real(_wdata2.range)) ? _wdata2.range : 5;
+                    var _amm2 = (variable_struct_exists(_wdata2, "ammo") && is_real(_wdata2.ammo)) ? _wdata2.ammo : 0;
+                    array_push(_vg.stacks, { w: _wname2, n: 1, att: _att2, ap: _ap2, rng: _rng2, amm: _amm2 });
                 }
                 if (array_length(_vg.stacks) <= 0) {
                     _vg = undefined;
@@ -5096,10 +5489,383 @@ function grid_gear_apply(_sq, _agg, _k) {
     _sq.geared = true;
 }
 
+/// @function grid_build_members
+/// @description Builds the per-member state array from a squad's real roster
+/// refs. Each marine gets his own HP, mapped armour, weapon and independent
+/// ammunition. The squad-level men / hp_pool / hp_max are then resynced to the
+/// member data so the aggregate always reflects the actual bodies standing.
+/// Depends on the personal weapon fields collected in grid_collect_blocks.
+function grid_build_members(_sq, _refs) {
+    _sq.members = [];
+    var _total_hp = 0;
+    var _total_max = 0;
+    for (var _i = 0; _i < array_length(_refs); _i++) {
+        var _rf = _refs[_i];
+        if (_rf.veh) {
+            continue;
+        }
+        // Personal armour: map the real AC through the segment table. Fall back
+        // to the squad's aggregated armour if the ref has no usable AC.
+        var _arm = (_rf.mac > 0) ? grid_armour_scale(_rf.mac) : _sq.armour;
+        // Personal weapon. If collection did not produce one, fall back to the
+        // squad's legacy weapon fields.
+        var _wname = variable_struct_exists(_rf, "mwep") ? _rf.mwep : "";
+        if (_wname == "") {
+            _wname = _sq.wep;
+        }
+        var _w_bal = _sq.bal;
+        var _w_rng = _sq.rng;
+        var _w_ap = _sq.ap_r;
+        var _w_amm = _sq.ammo;
+        if (variable_struct_exists(_rf, "mwatt") && (_rf.mwatt > 0)) {
+            var _gear_k = 18 / 275; // Bolter anchor. Same shared constant as import.
+            _w_bal = clamp(round(_rf.mwatt * _gear_k), 1, 80);
+        }
+        if (variable_struct_exists(_rf, "mwrng") && (_rf.mwrng > 0)) {
+            _w_rng = clamp(round(1.9 * sqrt(max(1, _rf.mwrng))), 2, 40);
+        }
+        if (variable_struct_exists(_rf, "mwap") && (_rf.mwap > 0)) {
+            _w_ap = round(grid_ap_value(_rf.mwap));
+        }
+        if (variable_struct_exists(_rf, "mwammo") && (_rf.mwammo > 0)) {
+            _w_amm = clamp(round(_rf.mwammo), 4, 240);
+        }
+        // Personal HP: use the real marine hit points through the same
+        // calibration the enemy table uses, with no damage resistance present
+        // for marines (dr 0). Fall back to the squad's hp_man if missing.
+        var _hp = (_rf.mhp > 0) ? max(1, round(_rf.mhp * 2 / 15)) : _sq.hp_man;
+        var _member = {
+            uid: variable_struct_exists(_rf, "uid") ? _rf.uid : "",
+            co: variable_struct_exists(_rf, "co") ? _rf.co : -1,
+            slot: variable_struct_exists(_rf, "slot") ? _rf.slot : -1,
+            mhp: _hp,
+            mhp_max: _hp,
+            armour: _arm,
+            alive: true,
+            wep: _wname,
+            bal: _w_bal,
+            rng: _w_rng,
+            ap_r: _w_ap,
+            ammo: _w_amm,
+            ammo0: _w_amm,
+            ammo_out: false,
+        };
+        array_push(_sq.members, _member);
+        _total_max += _hp;
+        _total_hp += _hp;
+    }
+    // Resync the aggregated squad fields to the member array. These remain the
+    // display values; damage resolution switches to members in a later batch.
+    _sq.men = array_length(_sq.members);
+    _sq.men0 = _sq.men;
+    _sq.hp_pool = _total_hp;
+    _sq.hp_max = _total_max;
+    if (_sq.men > 0) {
+        _sq.hp_man = max(1, round(_total_max / _sq.men));
+    }
+}
+
+/// @function grid_alive_member_indices
+/// @description Returns the indices of living members in a squad's member
+/// array. Used whenever a volley must pick victims at random.
+function grid_alive_member_indices(_s) {
+    var _out = [];
+    for (var _i = 0; _i < array_length(_s.members); _i++) {
+        if (_s.members[_i].alive) {
+            array_push(_out, _i);
+        }
+    }
+    return _out;
+}
+
+/// @function grid_pick_member_victim
+/// @description Chooses a random living member of a squad. Returns -1 when
+/// nobody is standing.
+function grid_pick_member_victim(_s) {
+    var _alive = grid_alive_member_indices(_s);
+    if (array_length(_alive) <= 0) {
+        return -1;
+    }
+    return _alive[irandom(array_length(_alive) - 1)];
+}
+
+/// @function grid_build_enemy_members
+/// @description Builds per-member state for a spawned enemy squad. Enemy
+/// infantry have no real unit_struct, so every member is an identical copy of
+/// the type profile. This gives them the same per-member HP, armour, weapon
+/// and ammunition fields the player side gets, so the same member volley path
+/// can resolve both directions.
+function grid_build_enemy_members(_sq, _d) {
+    _sq.members = [];
+    var _hp = _d.hp_man;
+    var _arm = _d.armour;
+    var _bal = _d.bal;
+    var _rng = _d.rng;
+    var _ap = _sq.ap_r;
+    var _amm = _sq.ammo;
+    for (var _i = 0; _i < _d.men; _i++) {
+        array_push(_sq.members, {
+            uid: "",
+            co: -1,
+            slot: -1,
+            mhp: _hp,
+            mhp_max: _hp,
+            armour: _arm,
+            alive: true,
+            wep: _d.disp,
+            bal: _bal,
+            rng: _rng,
+            ap_r: _ap,
+            ammo: _amm,
+            ammo0: _amm,
+            ammo_out: false,
+        });
+    }
+    _sq.hp_pool = _d.men * _hp;
+    _sq.hp_max = _sq.hp_pool;
+}
+
+/// @function grid_sync_weapon_slots
+/// @description Rebuilds a squad's weapon slots from its living members,
+/// grouping by weapon name. Each slot records the aggregate ballistic skill
+/// (sum of member bal), the longest range among them, the best AP, total
+/// remaining ammunition for display, and how many living members carry it.
+/// Previous fire cooldowns are preserved by matching weapon names, so a
+/// rebuild does not let a heavy weapon bypass its reload.
+function grid_sync_weapon_slots(_s) {
+    if (array_length(_s.members) <= 0) {
+        return;
+    }
+    // Remember current cooldowns by weapon name.
+    var _cd = {};
+    for (var _w = 0; _w < array_length(_s.weapons); _w++) {
+        var _old = _s.weapons[_w];
+        _cd[$ _old.wep] = _old.fire_cd;
+    }
+    // Group living members by weapon name.
+    var _groups = [];
+    var _keys = [];
+    for (var _i = 0; _i < array_length(_s.members); _i++) {
+        var _m = _s.members[_i];
+        if (!_m.alive) {
+            continue;
+        }
+        var _k = _m.wep;
+        var _idx = array_get_index(_keys, _k);
+        if (_idx < 0) {
+            array_push(_keys, _k);
+            array_push(_groups, {
+                count: 0,
+                bal: 0,
+                rng: 0,
+                ap_r: 0,
+                ammo: 0,
+            });
+            _idx = array_length(_groups) - 1;
+        }
+        _groups[_idx].count += 1;
+        _groups[_idx].bal += _m.bal;
+        _groups[_idx].rng = max(_groups[_idx].rng, _m.rng);
+        _groups[_idx].ap_r = max(_groups[_idx].ap_r, _m.ap_r);
+        _groups[_idx].ammo += _m.ammo;
+    }
+    // Build the new slot array.
+    var _new = [];
+    for (var _g = 0; _g < array_length(_keys); _g++) {
+        var _grp = _groups[_g];
+        if (_grp.count <= 0) {
+            continue;
+        }
+        var _cd_val = 0;
+        if (variable_struct_exists(_cd, _keys[_g])) {
+            _cd_val = _cd[$ _keys[_g]];
+        }
+        array_push(_new, {
+            wep: _keys[_g],
+            bal: _grp.bal,
+            rng: _grp.rng,
+            ap_r: _grp.ap_r,
+            ammo: _grp.ammo,
+            count: _grp.count,
+            fire_int: 1,
+            fire_cd: _cd_val,
+            ammo_out: false,
+        });
+    }
+    if (array_length(_new) == 0) {
+        // No living shooters: keep one empty slot so indexes stay valid.
+        array_push(_new, {
+            wep: _s.wep,
+            bal: 0,
+            rng: 1,
+            ap_r: 0,
+            ammo: 0,
+            count: 0,
+            fire_int: 1,
+            fire_cd: 0,
+            ammo_out: false,
+        });
+    }
+    _s.weapons = _new;
+}
+
+/// @function grid_weapon_abbrev
+/// @description Short display abbreviation for a weapon name, used inside the
+/// member icon grid so a tile can fit the weapon type instead of a long name.
+function grid_weapon_abbrev(_wep_name) {
+    var _s = string_lower(string(_wep_name));
+    if (string_pos("lascannon", _s) > 0) return "LC";
+    if (string_pos("plasma", _s) > 0) return "PG";
+    if (string_pos("meltagun", _s) > 0 || string_pos("multi-melta", _s) > 0) return "MG";
+    if (string_pos("heavy bolter", _s) > 0) return "HB";
+    if (string_pos("assault cannon", _s) > 0) return "AC";
+    if (string_pos("storm bolter", _s) > 0) return "SB";
+    if (string_pos("bolt pistol", _s) > 0) return "BP";
+    if (string_pos("bolter", _s) > 0) return "B";
+    if (string_pos("lasgun", _s) > 0) return "LG";
+    if (string_pos("laspistol", _s) > 0) return "LP";
+    if (string_pos("sniper", _s) > 0) return "SR";
+    if (string_pos("flamer", _s) > 0) return "FL";
+    if (string_pos("missile", _s) > 0) return "ML";
+    if (string_pos("autocannon", _s) > 0) return "AC";
+    if (string_pos("battle cannon", _s) > 0) return "BC";
+    if (string_pos("shoota", _s) > 0) return "SH";
+    if (string_pos("slugga", _s) > 0) return "SL";
+    if (string_pos("chainsword", _s) > 0) return "CS";
+    if (string_pos("power fist", _s) > 0) return "PF";
+    if (string_pos("lightning claw", _s) > 0) return "LC";
+    // Fallback: first two letters uppercase.
+    return string_upper(string_copy(_wep_name, 1, 2));
+}
+
+/// @function grid_member_grid_y
+/// @description Returns the y coordinate where the member icon grid begins in
+/// the right panel for the currently selected single squad. Shared by the Step
+/// click handler and the Draw event so hit testing and rendering agree.
+function grid_member_grid_y(ctrl) {
+    var _iy = GRIDC_BF_Y1 + 36;
+    var _py2 = _iy + 100;
+    _py2 += 24; // squad name
+    _py2 += 20; // type
+    _py2 += 20; // hull / men line
+    _py2 += 20; // armour line
+    _py2 += 20; // melee/ranged line (kept for layout consistency)
+    return _py2;
+}
+
+/// @function grid_member_icon_hit
+/// @description Returns the member index whose icon is at the given GUI
+/// position, or -1 when the click missed the member icon grid. Only valid when
+/// a single squad is selected and it has per-member state.
+function grid_member_icon_hit(ctrl, _mx, _my) {
+    var _isq = grid_selected_squads(ctrl);
+    if (array_length(_isq) != 1) {
+        return -1;
+    }
+    var _one = ctrl.squads[_isq[0]];
+    if (array_length(_one.members) <= 0) {
+        return -1;
+    }
+    var _gx0 = GRIDC_RP_X1 + 10;
+    var _gy0 = grid_member_grid_y(ctrl);
+    var _size = 36;
+    var _spacing = 4;
+    var _cols = 6;
+    for (var _i = 0; _i < array_length(_one.members); _i++) {
+        var _col = _i mod _cols;
+        var _row = _i div _cols;
+        var _x = _gx0 + _col * (_size + _spacing);
+        var _y = _gy0 + _row * (_size + _spacing);
+        if (point_in_rectangle(_mx, _my, _x, _y, _x + _size, _y + _size)) {
+            return _i;
+        }
+    }
+    return -1;
+}
+
+/// @function grid_draw_member_popup
+/// @description Draws the small tooltip for one member of a squad. Called from
+/// the Draw event when the mouse hovers or a member is selected. The popup sits
+/// to the left of the right panel and does not steal focus.
+function grid_draw_member_popup(ctrl, _squad, _mi, _icon_x, _icon_y, _size) {
+    var _m = _squad.members[_mi];
+    if (!is_struct(_m)) {
+        return;
+    }
+    // Compose lines.
+    var _title = "Member " + string(_mi + 1);
+    if (!_m.alive) {
+        _title = "Member " + string(_mi + 1) + " (KIA)";
+    }
+    var _lines = [];
+    array_push(_lines, $"{max(0, round(_m.mhp))} / {_m.mhp_max} HP");
+    array_push(_lines, $"Armour {_m.armour}");
+    array_push(_lines, $"{_m.wep} ({_m.bal} dmg, AP {_m.ap_r}, Rng {_m.rng})");
+    array_push(_lines, $"Ammo {_m.ammo} / {_m.ammo0}");
+    // Determine popup position: left of the icon, vertically centred on it.
+    var _pw = 230;
+    var _ph = 12 + 14 + (array_length(_lines) * 16) + 8;
+    var _px = _icon_x - _pw - 8;
+    var _py = clamp(_icon_y + (_size / 2) - (_ph / 2), GRIDC_BF_Y1 + 4, GRIDC_BF_Y2 - _ph - 4);
+    if (_px < GRIDC_BF_X1 + 4) {
+        // Not enough room on the left: draw it inside the panel instead.
+        _px = _icon_x + _size + 8;
+    }
+    // Frame.
+    draw_set_color(c_black);
+    draw_set_alpha(0.94);
+    draw_rectangle(_px, _py, _px + _pw, _py + _ph, false);
+    draw_set_alpha(1);
+    draw_set_color(GRIDC_GREEN);
+    draw_rectangle(_px, _py, _px + _pw, _py + _ph, true);
+    draw_set_font(fnt_40k_12);
+    draw_set_color(c_white);
+    draw_text(_px + 8, _py + 4, _title);
+    draw_set_color(GRIDC_GREEN);
+    var _ly = _py + 20;
+    for (var _i = 0; _i < array_length(_lines); _i++) {
+        // First line is HP: draw a small health bar behind it.
+        if (_i == 0) {
+            var _frac = clamp(_m.mhp / max(1, _m.mhp_max), 0, 1);
+            draw_set_color(c_black);
+            draw_rectangle(_px + 8, _ly + 12, _px + _pw - 8, _ly + 16, false);
+            draw_set_color((_frac > 0.5) ? GRIDC_GREEN : ((_frac > 0.25) ? c_yellow : GRIDC_RED));
+            draw_rectangle(_px + 8, _ly + 12, _px + 8 + (_pw - 16) * _frac, _ly + 16, false);
+        }
+        draw_set_color((_i == 0) ? GRIDC_GREEN : c_white);
+        draw_text(_px + 8, _ly, _lines[_i]);
+        _ly += 16;
+    }
+}
+
+/// @function grid_sync_squad_fields
+/// @description Recomputes the squad-level aggregated fields from its member
+/// array. Called whenever members die so men, hp_pool and hp_max reflect the
+/// bodies still standing. Also rebuilds the weapon slots so mixed squads keep
+/// their actual firepower and ammo summary accurate.
+function grid_sync_squad_fields(_s) {
+    var _men = 0;
+    var _hp = 0;
+    var _hpmax = 0;
+    for (var _i = 0; _i < array_length(_s.members); _i++) {
+        if (_s.members[_i].alive) {
+            _men += 1;
+            _hp += max(0, _s.members[_i].mhp);
+        }
+        _hpmax += _s.members[_i].mhp_max;
+    }
+    _s.men = _men;
+    _s.hp_pool = _hp;
+    _s.hp_max = _hpmax;
+    grid_sync_weapon_slots(_s);
+}
+
 /// @function grid_import_force
 /// @description Builds the player pool from a collected force instead of the
 /// generated test roster. Models are grouped into squads of the type's own size,
 /// so a hundred Tacticals become ten squads rather than a hundred single men.
+/// Infantry squads additionally build the per-member state array so personal
+/// HP, armour, weapon and ammunition survive into the battle.
 function grid_import_force(ctrl, _force) {
     // The Bolter is the yardstick. Fetched live from the gear table so the
     // anchor is whatever the mod's own data says a Bolter is; if the table
@@ -5147,13 +5913,16 @@ function grid_import_force(ctrl, _force) {
             if (_agg != undefined) {
                 grid_gear_apply(_sq, _agg, _gear_k);
             }
-            // A squad is only as strong as the men actually in it: a half filled
-            // final squad fields the models it has, not a full ten.
             if (!_def.vehicle) {
+                // Infantry: build the per-member state array and resync the
+                // aggregate display fields from it. This overrides the counts
+                // grid_gear_apply set, because the member data is authoritative
+                // for who is actually standing in the squad.
+                grid_build_members(_sq, _refs);
+            } else {
+                // A squad is only as strong as the vehicles actually in it.
                 _sq.men = array_length(_refs);
                 _sq.men0 = _sq.men;
-                _sq.hp_pool = _sq.men * _sq.hp_man;
-                _sq.hp_max = _sq.hp_pool;
             }
             array_push(ctrl.squads, _sq);
         }
